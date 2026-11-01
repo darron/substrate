@@ -35,6 +35,52 @@ import (
 
 const testActorUID = "actor-uid-1"
 
+func TestEgressDeactivationResetsGuestTCP(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	app, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Close()
+	if err := app.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	downstream, err := listener.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer downstream.Close()
+	upstream, origin := net.Pipe()
+	defer upstream.Close()
+	defer origin.Close()
+	dialed := make(chan struct{})
+	dialer := tunnelDialerFunc(func(context.Context, string) (net.Conn, error) {
+		close(dialed)
+		return upstream, nil
+	})
+	proxy, err := New(func(net.Conn) (string, error) { return "192.0.2.10:443", nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	expiry := time.Now().Add(time.Hour)
+	if err := proxy.Activate(testActorUID, dialer, fakeActorCertificateSource{expiresAt: expiry}, expiry); err != nil {
+		t.Fatal(err)
+	}
+	proxy.handle(downstream, proxy.active[testActorUID])
+	receiveWithin(t, dialed, "upstream connection")
+	if err := proxy.Deactivate(context.Background(), testActorUID); err != nil {
+		t.Fatal(err)
+	}
+	_, err = app.Read(make([]byte, 1))
+	if !errors.Is(err, syscall.ECONNRESET) {
+		t.Fatalf("guest read after deactivation = %v, want ECONNRESET", err)
+	}
+}
+
 type delayedEgressListener struct {
 	net.Listener
 	accepted chan struct{}

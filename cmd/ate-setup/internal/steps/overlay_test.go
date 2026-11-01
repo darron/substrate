@@ -363,11 +363,9 @@ func TestSystemOverlayDefaultIsBase(t *testing.T) {
 	}
 }
 
-// pinnedWorkloads returns the Deployment and StatefulSet names in a rendered
-// manifest that carry the cordon-system-infra-components node pinning, mapped
-// to the pool each one selects, and every workload name seen. Only the shared
-// pool spreads its replicas, and no pool requires anti-affinity: that would
-// need a node per pod.
+// pinnedWorkloads returns workloads with the lab pool selector and every
+// workload name seen. Deployments spread their replicas; postgres and atelet
+// do not. No workload requires a node per replica through anti-affinity.
 func pinnedWorkloads(t *testing.T, manifest []byte) (pinned map[string]string, all []string) {
 	t.Helper()
 	pinned = map[string]string{}
@@ -394,29 +392,32 @@ func pinnedWorkloads(t *testing.T, manifest []byte) (pinned map[string]string, a
 		if err := yaml.Unmarshal([]byte(doc), &obj); err != nil {
 			t.Fatalf("rendered document is not valid YAML: %v", err)
 		}
-		if obj.Kind != "Deployment" && obj.Kind != "StatefulSet" {
+		if obj.Kind != "Deployment" && obj.Kind != "StatefulSet" && obj.Kind != "DaemonSet" {
 			continue
 		}
 		all = append(all, obj.Metadata.Name)
 		podSpec := obj.Spec.Template.Spec
-		pool := podSpec.NodeSelector["ate.dev/workloadType"]
+		pool := podSpec.NodeSelector["sandbox-lab-runtime"]
 		if pool == "" {
 			continue
 		}
+		if _, exists := podSpec.NodeSelector["ate.dev/workloadType"]; exists {
+			t.Errorf("workload %s retains the upstream pool selector", obj.Metadata.Name)
+		}
 		if !slices.ContainsFunc(podSpec.Tolerations, func(tol map[string]any) bool {
-			return tol["key"] == "ate.dev/workloadType" && tol["value"] == pool
+			return tol["key"] == "ate.dev/sandboxClass" && tol["operator"] == "Exists" && tol["effect"] == "NoSchedule"
 		}) {
 			t.Errorf("workload %s selects pool %s but does not tolerate its taint", obj.Metadata.Name, pool)
 		}
 		if podSpec.Affinity["podAntiAffinity"] != nil {
 			t.Errorf("workload %s has pod anti-affinity", obj.Metadata.Name)
 		}
-		if spread := len(podSpec.TopologySpreadConstraints) > 0; spread != (pool == "ate-system-infra") {
+		if spread := len(podSpec.TopologySpreadConstraints) > 0; spread != (obj.Kind == "Deployment") {
 			t.Errorf("workload %s in pool %s: topology spread = %v", obj.Metadata.Name, pool, spread)
 		}
 		// The spread narrows on the app label; without it the workload would
 		// spread against the whole pool instead of its own replicas.
-		if pool == "ate-system-infra" && obj.Spec.Template.Metadata.Labels["app"] == "" {
+		if obj.Kind == "Deployment" && obj.Spec.Template.Metadata.Labels["app"] == "" {
 			t.Errorf("workload %s has no app label to spread its replicas by", obj.Metadata.Name)
 		}
 		pinned[obj.Metadata.Name] = pool
@@ -428,8 +429,8 @@ func pinnedWorkloads(t *testing.T, manifest []byte) (pinned map[string]string, a
 // to carry the pinning, since each workload reaches the cluster through a
 // different one: the system bundle, the lone redeploy files, the podcert
 // overlay, the postgres file, the egress variants, and the bundled credential
-// provider. postgres gets a pool of its own; every other system infra
-// workload shares one.
+// provider. The lab places postgres and atelet on the same substrate pool
+// as the system infra workloads.
 func TestRenderCordonSystemInfraComponents(t *testing.T) {
 	root := repoRoot(t)
 	for _, tc := range []struct {
@@ -442,19 +443,19 @@ func TestRenderCordonSystemInfraComponents(t *testing.T) {
 			name: "base bundle",
 			cfg:  config.Config{Router: config.RouterEnvoy},
 			path: func(e *Env) string { return e.Cfg.Path(SystemOverlay(e.Cfg)) },
-			want: []string{"ate-api-server", "ate-idp-server", "ate-controller", "atenet-router"},
+			want: []string{"ate-api-server", "ate-idp-server", "ate-controller", "atenet-router", "atelet"},
 		},
 		{
 			name: "kind bundle",
 			cfg:  config.Config{Router: config.RouterEnvoy, Kind: true},
 			path: func(e *Env) string { return e.Cfg.Path(SystemOverlay(e.Cfg)) },
-			want: []string{"ate-api-server", "ate-idp-server", "ate-controller", "atenet-router"},
+			want: []string{"ate-api-server", "ate-idp-server", "ate-controller", "atenet-router", "atelet"},
 		},
 		{
 			name: "agentgateway bundle",
 			cfg:  config.Config{Router: config.RouterAgentgateway},
 			path: func(e *Env) string { return e.Cfg.Path(SystemOverlay(e.Cfg)) },
-			want: []string{"ate-api-server", "ate-idp-server", "ate-controller", "atenet-router"},
+			want: []string{"ate-api-server", "ate-idp-server", "ate-controller", "atenet-router", "atelet"},
 		},
 		{
 			name: "api server file",
@@ -482,6 +483,16 @@ func TestRenderCordonSystemInfraComponents(t *testing.T) {
 			cfg:  config.Config{ClusterSize: config.ClusterSizeSize10},
 			path: func(e *Env) string { return e.Cfg.Manifest("podcert-size10") },
 			want: []string{"podcertificate-controller"},
+		},
+		{
+			name: "atelet file",
+			path: func(e *Env) string { return e.Cfg.Manifest("atelet.yaml") },
+			want: []string{"atelet"},
+		},
+		{
+			name: "kind atelet overlay",
+			path: func(e *Env) string { return e.Cfg.Manifest("kind/atelet") },
+			want: []string{"atelet"},
 		},
 		{
 			name: "postgres file",
@@ -520,16 +531,12 @@ func TestRenderCordonSystemInfraComponents(t *testing.T) {
 				if !slices.Contains(all, name) {
 					t.Errorf("rendered manifest has no workload %s (found %v)", name, all)
 				}
-				want := "ate-system-infra"
-				if name == "postgres" {
-					want = "ate-postgres"
-				}
+				want := "substrate"
 				if got := pinned[name]; got != want {
 					t.Errorf("workload %s pinned to pool %q, want %q", name, got, want)
 				}
 			}
-			// The DaemonSet-shaped and demo workloads stay off the pools; only
-			// the named system infra workloads are pinned.
+			// Only the named system infra workloads and atelet are pinned.
 			for name := range pinned {
 				if !slices.Contains(tc.want, name) {
 					t.Errorf("workload %s is pinned but is not a system infra workload", name)
@@ -556,7 +563,7 @@ func TestRenderBytesCordonSystemInfraComponents(t *testing.T) {
 		t.Fatalf("renderBytes: %v", err)
 	}
 	pinned, _ := pinnedWorkloads(t, rendered)
-	if pinned["atenet-egress"] != "ate-system-infra" {
+	if pinned["atenet-egress"] != "substrate" {
 		t.Errorf("atenet-egress is not pinned in the composed extproc manifest (pinned: %v)", pinned)
 	}
 	if !strings.Contains(string(rendered), additionalEgressExtprocCluster) {
@@ -778,8 +785,8 @@ func TestRenderFakeDataPlane(t *testing.T) {
 			if cfg.CordonSystemInfraComponents {
 				pinned, _ := pinnedWorkloads(t, rendered)
 				for _, name := range []string{"ate-controller", fakeWorkersyncDeployment} {
-					if pinned[name] != "ate-system-infra" {
-						t.Errorf("under --cordon-system-infra-components %s is pinned to %q, want ate-system-infra", name, pinned[name])
+					if pinned[name] != "substrate" {
+						t.Errorf("under --cordon-system-infra-components %s is pinned to %q, want substrate", name, pinned[name])
 					}
 				}
 			}

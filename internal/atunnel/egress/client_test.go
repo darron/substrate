@@ -975,10 +975,9 @@ func TestCopyBothWaysHTTP2Stream(t *testing.T) {
 	}
 	defer downstream.Close()
 
-	copied := make(chan struct{})
+	copied := make(chan error, 1)
 	go func() {
-		copyBothWays(downstream, upstream)
-		close(copied)
+		copied <- copyBothWays(downstream, upstream)
 	}()
 
 	// Mix write sizes around streamCopy's buffer sizes, then end the stream.
@@ -1009,7 +1008,69 @@ func TestCopyBothWaysHTTP2Stream(t *testing.T) {
 	if len(got) != len(sent) || string(got) != string(sent) {
 		t.Fatalf("echo returned %d bytes, want the %d sent", len(got), len(sent))
 	}
-	receiveWithin(t, copied, "copyBothWays to return")
+	if err := receiveWithin(t, copied, "copyBothWays to return"); err != nil {
+		t.Fatalf("forwarding echo: %v", err)
+	}
+}
+
+func TestCopyBothWaysHTTP2ResetReachesGuest(t *testing.T) {
+	ca := newTestCA(t)
+	release := make(chan struct{})
+	releaseRequest := sync.OnceFunc(func() { close(release) })
+	defer releaseRequest()
+	address, _ := serveTestH2ConnectGateway(t, ca, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		if _, err := io.WriteString(w, "partial response"); err != nil {
+			return
+		}
+		if err := http.NewResponseController(w).Flush(); err != nil {
+			return
+		}
+		<-release
+		panic(http.ErrAbortHandler)
+	}))
+	client := newTestClient(t, ca, withDialer(dialFixedAddress(address)))
+	defer client.Close()
+	upstream, err := client.DialContext(context.Background(), "192.0.2.10:443")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer upstream.Close()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	app, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Close()
+	if err := app.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	downstream, err := listener.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer downstream.Close()
+	copied := make(chan error, 1)
+	go func() {
+		copied <- copyBothWays(downstream, upstream)
+	}()
+	payload := make([]byte, len("partial response"))
+	if _, err := io.ReadFull(app, payload); err != nil || string(payload) != "partial response" {
+		t.Fatalf("partial response = %q, err = %v", payload, err)
+	}
+	// Keep the guest's write side open when the CONNECT stream resets.
+	releaseRequest()
+	_, err = app.Read(make([]byte, 1))
+	if !errors.Is(err, syscall.ECONNRESET) {
+		t.Fatalf("guest read error = %v, want ECONNRESET", err)
+	}
+	if err := receiveWithin(t, copied, "failed forwarding to stop both copies"); err == nil {
+		t.Fatal("forwarding reset returned no error")
+	}
 }
 
 func TestH2StreamConnWriteToStopsOnClose(t *testing.T) {
@@ -1069,5 +1130,12 @@ func TestH2StreamConnWriteToHonorsReadDeadline(t *testing.T) {
 	}
 	if got.String() != "delayed" {
 		t.Errorf("got %q, want delayed", got.String())
+	}
+}
+
+func TestH2ConfigReceiveBuffers(t *testing.T) {
+	c := h2Config()
+	if c.MaxReceiveBufferPerStream != h2StreamReceiveBuffer || c.MaxReceiveBufferPerConnection < c.MaxReceiveBufferPerStream {
+		t.Fatalf("h2Config() = %+v, want per-stream %d and a connection buffer at least as large", c, h2StreamReceiveBuffer)
 	}
 }

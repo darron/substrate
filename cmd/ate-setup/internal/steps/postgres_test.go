@@ -317,10 +317,12 @@ func labeledNode(name string, labels map[string]string) runtime.Object {
 
 // Under --cordon-system-infra-components the StatefulSet's rolling update
 // deletes the running postgres before its replacement schedules, so a cluster
-// with no ate-postgres node must be refused before anything is applied.
+// with no substrate pool node must be refused before anything is applied.
+// The positive fixture carries the lab pool label. The negative case keeps
+// a distractor node with only the upstream system-infra label.
 func TestRequirePostgresPool(t *testing.T) {
 	systemInfra := labeledNode("infra-1", map[string]string{"ate.dev/workloadType": "ate-system-infra"})
-	postgres := labeledNode("pg-1", map[string]string{"ate.dev/workloadType": "ate-postgres"})
+	postgres := labeledNode("pg-1", map[string]string{"sandbox-lab-runtime": "substrate"})
 	for _, tc := range []struct {
 		name    string
 		cordon  bool

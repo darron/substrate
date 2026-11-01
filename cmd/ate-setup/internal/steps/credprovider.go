@@ -16,6 +16,10 @@ package steps
 
 import (
 	"context"
+	"fmt"
+
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"go.ate.dev/substrate/cmd/ate-setup/internal/log"
 )
@@ -24,9 +28,11 @@ import (
 // outside the ate-install tree because only installs that select the provider
 // apply them. sample-secret.yaml in the same directory is never applied.
 const (
-	k8sCredentialProviderDir            = "manifests/egress-credential-injection"
-	k8sCredentialProviderManifest       = "k8s-credential-provider.yaml"
-	k8sCredentialProviderPolicyManifest = "namespace-policy.yaml"
+	k8sCredentialProviderDir               = "manifests/egress-credential-injection"
+	k8sCredentialProviderNamespaceManifest = "credential-namespace.yaml"
+	k8sCredentialProviderLegacyBinding     = "k8s-credential-provider-secret-reader"
+	k8sCredentialProviderManifest          = "k8s-credential-provider.yaml"
+	k8sCredentialProviderPolicyManifest    = "namespace-policy.yaml"
 
 	// Object names from the manifests above; credprovider_test.go checks them.
 	k8sCredentialProviderDeployment      = "k8s-credential-provider"
@@ -42,6 +48,9 @@ func (e *Env) k8sCredentialProviderPath(manifest string) string {
 // but it holds the operator's atespace allow-list, which a redeploy must keep.
 func (e *Env) deployK8sCredentialProvider(ctx context.Context) error {
 	log.Step("deploy_k8s_credential_provider")
+	if err := e.Kube.ApplyPath(ctx, e.k8sCredentialProviderPath(k8sCredentialProviderNamespaceManifest)); err != nil {
+		return err
+	}
 	exists, err := e.Kube.ConfigMapExists(ctx, e.Namespace(), k8sCredentialProviderPolicyConfigMap)
 	if err != nil {
 		return err
@@ -51,17 +60,33 @@ func (e *Env) deployK8sCredentialProvider(ctx context.Context) error {
 			return err
 		}
 	}
-	return e.renderResolveApply(ctx, e.k8sCredentialProviderPath(k8sCredentialProviderManifest))
+	if err := e.renderResolveApply(ctx, e.k8sCredentialProviderPath(k8sCredentialProviderManifest)); err != nil {
+		return err
+	}
+	return e.removeLegacyCredentialProviderBinding(ctx)
 }
 
 // removeK8sCredentialProvider removes a bundled provider left by an earlier
 // install, so that it does not keep its cluster-wide Secret read once the
 // gateway no longer uses it.
 func (e *Env) removeK8sCredentialProvider(ctx context.Context) error {
+	if err := e.removeLegacyCredentialProviderBinding(ctx); err != nil {
+		return err
+	}
 	running, err := e.Kube.DeploymentExists(ctx, e.Namespace(), k8sCredentialProviderDeployment)
 	if err != nil || !running {
 		return err
 	}
 	log.Step("remove_k8s_credential_provider")
 	return e.Kube.DeletePath(ctx, e.k8sCredentialProviderPath(k8sCredentialProviderManifest))
+}
+
+// removeLegacyCredentialProviderBinding removes the cluster-wide grant that
+// older installs used. Applying a namespaced RoleBinding does not replace it.
+func (e *Env) removeLegacyCredentialProviderBinding(ctx context.Context) error {
+	err := e.Kube.Typed.RbacV1().ClusterRoleBindings().Delete(ctx, k8sCredentialProviderLegacyBinding, metav1.DeleteOptions{})
+	if err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("while removing the legacy credential provider binding: %w", err)
+	}
+	return nil
 }

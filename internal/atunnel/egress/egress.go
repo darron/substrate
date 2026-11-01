@@ -329,29 +329,43 @@ func (e *Proxy) handle(downstream net.Conn, active *activation) {
 		defer upstream.Close()
 
 		stop := context.AfterFunc(active.ctx, func() {
-			_ = downstream.Close()
+			_ = resetTCP(downstream)
 			_ = upstream.Close()
 		})
 		defer stop()
 
-		copyBothWays(downstream, upstream)
+		if err := copyBothWays(downstream, upstream); err != nil && active.ctx.Err() == nil {
+			slog.WarnContext(active.ctx, "atunnel egress forwarding failed", slog.String("destination", destination), slog.Any("err", err))
+		}
 	}()
 }
 
-func copyBothWays(a, b net.Conn) {
-	done := make(chan struct{}, 2)
-	go func() {
-		_, _ = copyConn(a, b)
-		closeWrite(a)
-		done <- struct{}{}
-	}()
-	go func() {
-		_, _ = copyConn(b, a)
-		closeWrite(b)
-		done <- struct{}{}
-	}()
-	<-done
-	<-done
+func copyBothWays(downstream, upstream net.Conn) error {
+	done := make(chan error, 2)
+	copyDirection := func(dst, src net.Conn, direction string) {
+		_, err := copyConn(dst, src)
+		if err == nil {
+			err = closeWrite(dst)
+		}
+		if err != nil {
+			err = fmt.Errorf("egress: %s: %w", direction, err)
+		}
+		done <- err
+	}
+	go copyDirection(downstream, upstream, "upstream to guest")
+	go copyDirection(upstream, downstream, "guest to upstream")
+	var result error
+	for range 2 {
+		if err := <-done; err != nil {
+			if result == nil {
+				// A normal FIN would hide a truncated CONNECT response.
+				result = errors.Join(err, resetTCP(downstream), upstream.Close())
+			} else {
+				result = errors.Join(result, err)
+			}
+		}
+	}
+	return result
 }
 
 // copyConn copies src to dst until EOF. Unlike io.Copy, it doesn't hold a 32 KiB
@@ -363,10 +377,21 @@ func copyConn(dst, src net.Conn) (int64, error) {
 	return (&streamCopy{dest: dst, src: src}).do()
 }
 
-func closeWrite(conn net.Conn) {
+func closeWrite(conn net.Conn) error {
 	if conn, ok := conn.(interface{ CloseWrite() error }); ok {
-		_ = conn.CloseWrite()
+		return conn.CloseWrite()
 	}
+	return nil
+}
+
+func resetTCP(conn net.Conn) error {
+	var err error
+	if tcp, ok := conn.(interface{ SetLinger(int) error }); ok {
+		err = tcp.SetLinger(0)
+	} else {
+		err = fmt.Errorf("egress: cannot reset downstream connection of type %T", conn)
+	}
+	return errors.Join(err, conn.Close())
 }
 
 // PortFromListenAddr is the port from a listen address, which each sandbox's
