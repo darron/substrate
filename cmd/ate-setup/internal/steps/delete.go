@@ -44,6 +44,10 @@ import (
 func (e *Env) DeleteAteSystem(ctx context.Context) error {
 	log.Step("delete_ate_system")
 
+	if err := e.removeLegacyCredentialProviderBinding(ctx); err != nil {
+		return err
+	}
+
 	if err := e.Kube.DeletePath(ctx, e.k8sCredentialProviderPath(k8sCredentialProviderManifest)); err != nil {
 		return err
 	}
@@ -182,6 +186,10 @@ func (e *Env) DeleteTrustBundles(ctx context.Context) error {
 // it holds the operator's allow-list.
 func (e *Env) DeleteAtenet(ctx context.Context) error {
 	log.Step("delete_atenet")
+
+	if err := e.removeLegacyCredentialProviderBinding(ctx); err != nil {
+		return err
+	}
 
 	if err := e.Kube.DeletePath(ctx, e.k8sCredentialProviderPath(k8sCredentialProviderManifest)); err != nil {
 		return err

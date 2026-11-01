@@ -405,6 +405,22 @@ func (c *Client) runDial(dialCtx context.Context, call *dialCall) {
 	c.mu.Unlock()
 }
 
+// h2StreamReceiveBuffer is the per-stream HTTP/2 receive window atunnel
+// advertises to atenet-egress. When an origin closes a TCP passthrough before
+// the actor half-closes, Envoy resets the CONNECT stream and drops response
+// data it still holds for flow control. A window this size lets Envoy hand
+// over a slow reader's tail before that reset; atunnel buffers it instead.
+const h2StreamReceiveBuffer = 64 << 20
+
+func h2Config() *http.HTTP2Config {
+	return &http.HTTP2Config{
+		MaxReceiveBufferPerStream: h2StreamReceiveBuffer,
+		// A bound per HTTP/2 connection to atenet-egress; atunnel may open
+		// more connections when stream slots fill.
+		MaxReceiveBufferPerConnection: 4 * h2StreamReceiveBuffer,
+	}
+}
+
 func (c *Client) newH2ClientConn(ctx context.Context, tlsConn *tls.Conn, cert *tls.Certificate) (*h2ClientConn, error) {
 	raw := &trackedTLSConn{Conn: tlsConn}
 	var protocols http.Protocols
@@ -412,6 +428,7 @@ func (c *Client) newH2ClientConn(ctx context.Context, tlsConn *tls.Conn, cert *t
 	tr := &http.Transport{
 		Protocols:          &protocols,
 		DisableCompression: true,
+		HTTP2:              h2Config(),
 		DialTLSContext: func(context.Context, string, string) (net.Conn, error) {
 			return raw, nil
 		},

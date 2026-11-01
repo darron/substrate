@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# The lab installs control-plane components, PostgreSQL and atelet on nodes
+# labeled sandbox-lab-runtime=substrate. Those nodes support projected pod
+# certificates and carry the ate.dev/sandboxClass taint. The upstream text
+# below describes the original component labels.
+#
 # Keeps the system infra components off the worker nodes. Selected by
 # cmd/ate-setup under --cordon-system-infra-components, which wraps every
 # system infra apply in a kustomization that includes this component.
@@ -54,11 +59,10 @@ patches:
               ate.dev/workloadType: ate-system-infra
           spec:
             nodeSelector:
-              ate.dev/workloadType: ate-system-infra
+              sandbox-lab-runtime: substrate
             tolerations:
-            - key: ate.dev/workloadType
-              operator: Equal
-              value: ate-system-infra
+            - key: ate.dev/sandboxClass
+              operator: Exists
               effect: NoSchedule
             topologySpreadConstraints:
             # matchLabelKeys narrows the selector to pods sharing this pod's
@@ -83,9 +87,23 @@ patches:
         template:
           spec:
             nodeSelector:
-              ate.dev/workloadType: ate-postgres
+              sandbox-lab-runtime: substrate
             tolerations:
-            - key: ate.dev/workloadType
-              operator: Equal
-              value: ate-postgres
+            - key: ate.dev/sandboxClass
+              operator: Exists
               effect: NoSchedule
+  # Keep atelet on nodes that support projected pod certificates. Its
+  # upstream toleration already accepts the sandboxClass taint.
+  - target:
+      kind: DaemonSet
+      name: atelet
+    patch: |-
+      apiVersion: apps/v1
+      kind: DaemonSet
+      metadata:
+        name: overridden-by-target
+      spec:
+        template:
+          spec:
+            nodeSelector:
+              sandbox-lab-runtime: substrate

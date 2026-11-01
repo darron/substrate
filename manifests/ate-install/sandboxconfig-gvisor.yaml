@@ -23,6 +23,10 @@
 # A bump adds a version and points defaultVersion at it. Keep the
 # previous version unless it has a known vulnerability: an actor restores its
 # memory only on the version its snapshot was taken with.
+#
+# Retain v5 assets for existing memory snapshots during the RC1 upgrade.
+# If a snapshot's runtime version is absent, restore cold boots with its files
+# and loses memory. Remove v5 only after its resumable snapshots are retired.
 apiVersion: ate.dev/v1
 kind: SandboxConfig
 metadata:
@@ -33,6 +37,20 @@ spec:
   sandboxClass: gvisor
   defaultVersion: v6
   versions:
+  # gVisor release 20261019.0, retained from the pre-upgrade live cluster so
+  # actors whose memory snapshots were taken under v5 keep restoring with v5.
+  # New and cold-booting actors select v6 below.
+  - name: v5
+    state: Enabled
+    assets:
+      amd64:
+        gvisor:
+          url: "gs://gvisor/releases/release/20261019.0/x86_64/gvisor.tar.zstd"
+          sha256: "8637abfb50f81552af25ca08f7172589c09292a7c881efe8d9e09a9f3b6bec7b"
+      arm64:
+        gvisor:
+          url: "gs://gvisor/releases/release/20261019.0/aarch64/gvisor.tar.zstd"
+          sha256: "88556c21468a066d872a055425958c83fcbafc79c6477a195b18070c77f856d0"
   # gVisor release 20261026.0. ateworker-gvisor saves container rootfs overlays
   # (rootfs/) and durable-dir volumes (fs/) as separate checkpoint bundles. That
   # needs google/gvisor@b79256080dec, first in tagged release 20261019.0.

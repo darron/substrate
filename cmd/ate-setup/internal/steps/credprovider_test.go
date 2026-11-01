@@ -15,11 +15,26 @@
 package steps
 
 import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
 	"testing"
 
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/kubernetes/fake"
+	clienttesting "k8s.io/client-go/testing"
 
 	"go.ate.dev/substrate/cmd/ate-setup/internal/config"
+	"go.ate.dev/substrate/cmd/ate-setup/internal/images"
 	"go.ate.dev/substrate/cmd/ate-setup/internal/kube"
 )
 
@@ -201,4 +216,122 @@ func mountedConfigMaps(dep *unstructured.Unstructured) []string {
 		}
 	}
 	return names
+}
+
+func TestRemoveK8sCredentialProviderPreservesCredentials(t *testing.T) {
+	ctx := t.Context()
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "trial-secrets"}}
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "operator-credential", Namespace: ns.Name}, Data: map[string][]byte{"token": []byte("preserve")}}
+	dep := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: k8sCredentialProviderDeployment, Namespace: NamespaceAteSystem}}
+	legacy := &rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: k8sCredentialProviderLegacyBinding}}
+	k, dc := fakeDeleteKube(t, []runtime.Object{dep, legacy}, []runtime.Object{ns, secret})
+	cs := k.Typed.(*fake.Clientset)
+	cs.Fake.Resources[0].APIResources = append(cs.Fake.Resources[0].APIResources,
+		metav1.APIResource{Name: "namespaces", Kind: "Namespace"},
+		metav1.APIResource{Name: "secrets", Kind: "Secret", Namespaced: true},
+		metav1.APIResource{Name: "services", Kind: "Service", Namespaced: true})
+	e := &Env{Cfg: &config.Config{Root: repoRoot(t)}, Kube: k}
+	if err := e.removeK8sCredentialProvider(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, action := range dc.Actions() {
+		if action.GetVerb() == "delete" && (action.GetResource().Resource == "namespaces" || action.GetResource().Resource == "secrets") {
+			t.Fatalf("provider removal deletes credentials: %v", action)
+		}
+	}
+	got, err := dc.Resource(schema.GroupVersionResource{Version: "v1", Resource: "secrets"}).Namespace(ns.Name).Get(ctx, secret.Name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if data, _, _ := unstructured.NestedStringMap(got.Object, "data"); data["token"] != "cHJlc2VydmU=" {
+		t.Fatalf("credential changed: %v", data)
+	}
+	if _, err := cs.RbacV1().ClusterRoleBindings().Get(ctx, legacy.Name, metav1.GetOptions{}); !apierrors.IsNotFound(err) {
+		t.Fatalf("legacy grant remains: %v", err)
+	}
+}
+
+func TestRemoveLegacyCredentialProviderBinding(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		present, denied bool
+	}{
+		{name: "existing", present: true}, {name: "absent"}, {name: "forbidden", present: true, denied: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var objs []runtime.Object
+			if tc.present {
+				objs = append(objs, &rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: k8sCredentialProviderLegacyBinding}})
+			}
+			e := &Env{Kube: fakeKube(t, objs...)}
+			if tc.denied {
+				e.Kube.Typed.(*fake.Clientset).PrependReactor("delete", "clusterrolebindings", func(clienttesting.Action) (bool, runtime.Object, error) {
+					return true, nil, apierrors.NewForbidden(schema.GroupResource{Group: "rbac.authorization.k8s.io", Resource: "clusterrolebindings"}, k8sCredentialProviderLegacyBinding, errors.New("denied"))
+				})
+			}
+			if err := e.removeLegacyCredentialProviderBinding(t.Context()); (err != nil) != tc.denied {
+				t.Fatalf("error = %v, denied = %v", err, tc.denied)
+			}
+		})
+	}
+}
+
+func TestDeployK8sCredentialProviderReplacesLegacyGrant(t *testing.T) {
+	for _, failApply := range []bool{false, true} {
+		t.Run(fmt.Sprint("applyFailure=", failApply), func(t *testing.T) {
+			legacy := &rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: k8sCredentialProviderLegacyBinding}}
+			cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: k8sCredentialProviderPolicyConfigMap, Namespace: NamespaceAteSystem}}
+			k, dc := fakeDeleteKube(t, []runtime.Object{legacy, cm}, nil)
+			k.Typed.(*fake.Clientset).Fake.Resources[0].APIResources = append(k.Typed.(*fake.Clientset).Fake.Resources[0].APIResources, metav1.APIResource{Name: "namespaces", Kind: "Namespace"}, metav1.APIResource{Name: "services", Kind: "Service", Namespaced: true})
+			appliedBinding := false
+			dc.PrependReactor("patch", "*", func(action clienttesting.Action) (bool, runtime.Object, error) {
+				patch := action.(clienttesting.PatchAction)
+				obj := &unstructured.Unstructured{}
+				if err := json.Unmarshal(patch.GetPatch(), &obj.Object); err != nil {
+					t.Fatal(err)
+				}
+				if obj.GetKind() == "RoleBinding" {
+					if failApply {
+						return true, nil, apierrors.NewBadRequest("replacement failed")
+					}
+					appliedBinding = true
+				}
+				return true, obj, nil
+			})
+			k.Typed.(*fake.Clientset).PrependReactor("delete", "clusterrolebindings", func(action clienttesting.Action) (bool, runtime.Object, error) {
+				if !appliedBinding {
+					t.Fatal("legacy grant removed before replacement applied")
+				}
+				return false, nil, nil
+			})
+			src := images.Source{Repo: "example.com/substrate", Tag: "candidate"}
+			e := &Env{Cfg: &config.Config{Root: repoRoot(t)}, Kube: k, resolver: images.NewPrebuilt(src, func(context.Context, string) (string, error) { return "sha256:" + strings.Repeat("a", 64), nil })}
+			if err := e.deployK8sCredentialProvider(t.Context()); (err != nil) != failApply {
+				t.Fatalf("error = %v, failed apply = %v", err, failApply)
+			}
+			_, err := k.Typed.RbacV1().ClusterRoleBindings().Get(t.Context(), legacy.Name, metav1.GetOptions{})
+			if apierrors.IsNotFound(err) == failApply {
+				t.Fatalf("legacy binding state incorrect after deploy: %v", err)
+			}
+		})
+	}
+}
+
+func TestDeleteCredentialProviderRemovesLegacyGrantFirst(t *testing.T) {
+	for _, entry := range []struct {
+		name string
+		run  func(*Env) error
+	}{
+		{"ate-system", func(e *Env) error { return e.DeleteAteSystem(t.Context()) }},
+		{"atenet", func(e *Env) error { return e.DeleteAtenet(t.Context()) }},
+	} {
+		t.Run(entry.name, func(t *testing.T) {
+			e := &Env{Cfg: &config.Config{Root: repoRoot(t)}, Kube: fakeKube(t)}
+			denied := apierrors.NewForbidden(schema.GroupResource{Group: "rbac.authorization.k8s.io", Resource: "clusterrolebindings"}, k8sCredentialProviderLegacyBinding, errors.New("denied"))
+			e.Kube.Typed.(*fake.Clientset).PrependReactor("delete", "clusterrolebindings", func(clienttesting.Action) (bool, runtime.Object, error) { return true, nil, denied })
+			if err := entry.run(e); !errors.Is(err, denied) {
+				t.Fatalf("delete must surface legacy grant cleanup error before other teardown: %v", err)
+			}
+		})
+	}
 }

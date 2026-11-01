@@ -219,8 +219,9 @@ it alongside the gateway. The install applies:
 
 * the provider's ServiceAccount, its Deployment and its Service in
   `ate-system`;
-* a ClusterRole and ClusterRoleBinding that let it read Secrets in every
-  namespace;
+* a ClusterRole and a RoleBinding limited to `trial-secrets`; the install
+  removes the old cluster-wide binding after applying the replacement;
+* the `trial-secrets` namespace, which is retained when the provider is removed;
 * the `k8s-credential-provider-namespace-policy` ConfigMap, only when it is
   absent (see below); and
 * a NetworkPolicy that admits only the egress gateway's pods
@@ -238,7 +239,9 @@ every matching injection rule fails closed with 503.
 The provider enforces an atespace→namespace authorization policy, the
 `k8s-credential-provider-namespace-policy` ConfigMap in `ate-system`. The install creates
 it empty, granting nothing, and only when it is absent, so a redeploy keeps
-edits. Grant each atespace the namespaces whose Secrets it may resolve:
+edits. The bundled RoleBinding allows only `trial-secrets`; policy grants for
+other namespaces also need an operator-managed RoleBinding. Grant each atespace
+the namespaces whose Secrets it may resolve:
 
 ```bash
 kubectl -n ate-system edit configmap k8s-credential-provider-namespace-policy
@@ -259,7 +262,8 @@ so after editing, restart the provider:
 kubectl -n ate-system rollout restart deployment/k8s-credential-provider
 ```
 
-For a first smoke test, grant your actor's atespace `ns1` as above and apply a
+For a first smoke test, grant your actor's atespace `ns1` as above, add a
+RoleBinding there for the provider's Secret-reader role, and apply a
 sample secret that the URI in the sample policy resolves to:
 
 ```bash

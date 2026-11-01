@@ -105,7 +105,9 @@ const (
 
 // postgresPoolSelector selects the nodes of the pool the
 // cordon-system-infra-components component pins the bundled PostgreSQL to.
-const postgresPoolSelector = "ate.dev/workloadType=ate-postgres"
+// The lab component places PostgreSQL on the shared substrate pool.
+// Match its source-managed selector so replacement nodes pass this check.
+const postgresPoolSelector = "sandbox-lab-runtime=substrate"
 
 // postgresPlan says where ateapi's store comes from: the bundled StatefulSet,
 // or something the installer does not deploy. It gates both applying the
@@ -259,7 +261,8 @@ func (e *Env) requirePostgresPool(ctx context.Context) error {
 	}
 	if len(nodes.Items) == 0 {
 		return fmt.Errorf("--cordon-system-infra-components pins the bundled PostgreSQL to nodes labeled %s, and the cluster has none: "+
-			"create a one-node pool labeled and tainted %s:NoSchedule in the zone of the postgres volume first "+
+			"restore the substrate node pool (labeled %s, tainted ate.dev/sandboxClass=gvisor:NoSchedule) that the lab placement overlay targets, "+
+			"with a node in the zone of the postgres volume first "+
 			"(see docs/architecture.md#system-infra-isolation)", postgresPoolSelector, postgresPoolSelector)
 	}
 	return nil
