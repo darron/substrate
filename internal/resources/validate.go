@@ -423,9 +423,13 @@ var linuxCapabilities = sets.New(
 )
 
 // AllowedAddCapabilities are the capabilities a container may add.
+//
+// Lab patch: MKNOD, NET_ADMIN, NET_RAW and SYS_ADMIN are also accepted so the
+// lab's Docker-in-microVM lane can run dockerd. Upstream rejects them.
 var AllowedAddCapabilities = sets.New(
 	"AUDIT_WRITE", "CHOWN", "DAC_OVERRIDE", "FOWNER", "FSETID", "KILL",
 	"NET_BIND_SERVICE", "SETFCAP", "SETGID", "SETPCAP", "SETUID", "SYS_CHROOT",
+	"MKNOD", "NET_ADMIN", "NET_RAW", "SYS_ADMIN",
 )
 
 // ValidateAddCapabilities accepts only AllowedAddCapabilities.

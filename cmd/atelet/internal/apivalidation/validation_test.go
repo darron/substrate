@@ -1817,7 +1817,7 @@ func TestValidateContainer(t *testing.T) {
 			want: field.ErrorList{field.NotSupported[string](capsPath.Child("drop").Index(0), nil, nil)},
 		}, {
 			name: "capabilities: add outside the allowlist rejected",
-			obj:  caps([]string{"MKNOD", "SYS_ADMIN"}, nil),
+			obj:  caps([]string{"SYS_PTRACE", "SYS_MODULE"}, nil),
 			want: field.ErrorList{
 				field.NotSupported[string](capsPath.Child("add").Index(0), nil, nil),
 				field.NotSupported[string](capsPath.Child("add").Index(1), nil, nil),
